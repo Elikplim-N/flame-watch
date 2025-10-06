@@ -26,7 +26,14 @@ export default function App() {
       .limit(500);
     if (fromISO) q = q.gte("created_at", fromISO);
     const { data, error } = await q;
-    if (!error && data) setReadings(data as SensorReading[]);
+    if (!error && data) {
+      // force sort by created_at to be safe
+      const sorted = (data as SensorReading[]).sort(
+        (a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      );
+      setReadings(sorted);
+    }
     setLoading(false);
   }
 
@@ -40,7 +47,11 @@ export default function App() {
   }, [fromISO]);
 
   const latest = readings[0];
-  const flame = !!latest?.flame_detected;
+  // treat true, 1 or "1" as flame detected
+  const flame =
+    latest?.flame_detected === true ||
+    latest?.flame_detected === 1 ||
+    latest?.flame_detected === "1";
 
   return (
     <div>
@@ -64,7 +75,8 @@ export default function App() {
       <main className="container mx-auto py-6 space-y-8">
         <div className="grid gap-4 md:grid-cols-3">
           <Card>
-            <FlameIndicator detected={flame} />
+            {/* pass latestFlameDetected to match component signature */}
+            <FlameIndicator latestFlameDetected={flame} />
           </Card>
           <Card>
             <div className="text-sm opacity-70">Latest Temperature</div>
@@ -103,19 +115,27 @@ export default function App() {
               </thead>
               <tbody>
                 {readings.map((r) => {
-                  const d = r.timestamp_ms ? new Date(Number(r.timestamp_ms)) : new Date(r.created_at);
+                  const d = r.timestamp_ms
+                    ? new Date(Number(r.timestamp_ms))
+                    : new Date(r.created_at);
                   return (
                     <tr key={r.id} className="border-t">
                       <td className="py-2 pr-4">{d.toLocaleString()}</td>
                       <td className="py-2 pr-4">{r.temperature ?? "—"}</td>
                       <td className="py-2 pr-4">{r.humidity ?? "—"}</td>
                       <td className="py-2 pr-4">{r.gas_value ?? "—"}</td>
-                      <td className="py-2 pr-4">{r.flame_detected ? "🔥" : "—"}</td>
+                      <td className="py-2 pr-4">
+                        {r.flame_detected ? "🔥" : "—"}
+                      </td>
                     </tr>
                   );
                 })}
                 {readings.length === 0 && !loading && (
-                  <tr><td className="py-4 opacity-60" colSpan={5}>No data.</td></tr>
+                  <tr>
+                    <td className="py-4 opacity-60" colSpan={5}>
+                      No data.
+                    </td>
+                  </tr>
                 )}
               </tbody>
             </table>
