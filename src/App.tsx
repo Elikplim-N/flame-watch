@@ -9,6 +9,7 @@ import { FlameIndicator } from "./components/FlameIndicator";
 import { TempHumidityChart, GasChart } from "./components/Charts";
 
 const POLL_MS = 10000;
+const GH_TZ = "Africa/Accra";
 
 export default function App() {
   const [range, setRange] = useState<RangeKey>("6h");
@@ -27,7 +28,7 @@ export default function App() {
     if (fromISO) q = q.gte("created_at", fromISO);
     const { data, error } = await q;
     if (!error && data) {
-      // force sort by created_at to be safe
+      // Ensure newest first by DB time
       const sorted = (data as SensorReading[]).sort(
         (a, b) =>
           new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
@@ -47,19 +48,37 @@ export default function App() {
   }, [fromISO]);
 
   const latest = readings[0];
-  // treat true, 1 or "1" as flame detected
+
+  // Treat true, 1, or "1" as detected (in case your device sends non-boolean)
   const flame =
     latest?.flame_detected === true ||
     latest?.flame_detected === 1 ||
     latest?.flame_detected === "1";
 
+  // Format helper: always use DB 'created_at' → Accra time
+  const formatCreatedAt = (createdAt: string) =>
+    new Date(createdAt).toLocaleString("en-GB", {
+      timeZone: GH_TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+
   return (
     <div>
       <header className="sticky top-0 z-10 bg-white border-b">
         <div className="container mx-auto py-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-          <h1 className="text-2xl font-bold text-gray-800">
-            ESP32 Smoke & Gas Dashboard
-          </h1>
+          <div>
+            <h1 className="text-2xl font-bold text-gray-800">
+              ESP32 Smoke & Gas Dashboard
+            </h1>
+            <div className="text-xs text-gray-500">
+              All times shown in Africa/Accra (from DB <code>created_at</code>)
+            </div>
+          </div>
           <div className="flex items-center gap-3">
             <TimeRangePicker value={range} onChange={setRange} />
             <button
@@ -75,7 +94,7 @@ export default function App() {
       <main className="container mx-auto py-6 space-y-8">
         <div className="grid gap-4 md:grid-cols-3">
           <Card>
-            {/* pass latestFlameDetected to match component signature */}
+            {/* matches FlameIndicator prop signature */}
             <FlameIndicator latestFlameDetected={flame} />
           </Card>
           <Card>
@@ -92,12 +111,12 @@ export default function App() {
           </Card>
         </div>
 
-        <Card title="Temperature & Humidity">
+        <Card title="Temperature & Humidity (Accra time)">
           {loading && <div className="text-sm opacity-60">Loading…</div>}
           <TempHumidityChart data={readings} />
         </Card>
 
-        <Card title="Gas Value">
+        <Card title="Gas Value (Accra time)">
           <GasChart data={readings} />
         </Card>
 
@@ -106,7 +125,7 @@ export default function App() {
             <table className="min-w-full text-sm">
               <thead className="text-left opacity-70">
                 <tr>
-                  <th className="py-2 pr-4">Created</th>
+                  <th className="py-2 pr-4">Created (DB, Accra)</th>
                   <th className="py-2 pr-4">Temp (°C)</th>
                   <th className="py-2 pr-4">Humidity (%)</th>
                   <th className="py-2 pr-4">Gas</th>
@@ -114,22 +133,15 @@ export default function App() {
                 </tr>
               </thead>
               <tbody>
-                {readings.map((r) => {
-                  const d = r.timestamp_ms
-                    ? new Date(Number(r.timestamp_ms))
-                    : new Date(r.created_at);
-                  return (
-                    <tr key={r.id} className="border-t">
-                      <td className="py-2 pr-4">{d.toLocaleString()}</td>
-                      <td className="py-2 pr-4">{r.temperature ?? "—"}</td>
-                      <td className="py-2 pr-4">{r.humidity ?? "—"}</td>
-                      <td className="py-2 pr-4">{r.gas_value ?? "—"}</td>
-                      <td className="py-2 pr-4">
-                        {r.flame_detected ? "🔥" : "—"}
-                      </td>
-                    </tr>
-                  );
-                })}
+                {readings.map((r) => (
+                  <tr key={r.id} className="border-t">
+                    <td className="py-2 pr-4">{formatCreatedAt(r.created_at)}</td>
+                    <td className="py-2 pr-4">{r.temperature ?? "—"}</td>
+                    <td className="py-2 pr-4">{r.humidity ?? "—"}</td>
+                    <td className="py-2 pr-4">{r.gas_value ?? "—"}</td>
+                    <td className="py-2 pr-4">{r.flame_detected ? "🔥" : "—"}</td>
+                  </tr>
+                ))}
                 {readings.length === 0 && !loading && (
                   <tr>
                     <td className="py-4 opacity-60" colSpan={5}>
