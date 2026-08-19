@@ -1,61 +1,128 @@
 // src/App.tsx
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useState } from "react";
 import { supabase } from "./lib/supabase";
-import type { SensorReading } from "./types";
-import { rangeToStartISO, RangeKey } from "./utils/time";
+import type { TelemetryData, SystemConfig } from "./types";
 import { Card } from "./components/Card";
-import { TimeRangePicker } from "./components/TimeRangePicker";
-import { FlameIndicator } from "./components/FlameIndicator";
-import { TempHumidityChart, GasChart } from "./components/Charts";
+import { MoistureTankChart, EnvironmentChart } from "./components/Charts";
 
-const POLL_MS = 10000;
+const POLL_MS = 5000;
 const GH_TZ = "Africa/Accra";
 
 export default function App() {
-  const [range, setRange] = useState<RangeKey>("6h");
-  const [readings, setReadings] = useState<SensorReading[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [readings, setReadings] = useState<TelemetryData[]>([]);
+  const [config, setConfig] = useState<SystemConfig | null>(null);
+  const [loadingReadings, setLoadingReadings] = useState(true);
+  const [loadingConfig, setLoadingConfig] = useState(true);
+  const [submittingConfig, setSubmittingConfig] = useState(false);
 
-  const fromISO = useMemo(() => rangeToStartISO(range), [range]);
+  // Form states for config
+  const [pumpCommand, setPumpCommand] = useState<"AUTO" | "ON" | "OFF">("AUTO");
+  const [drySoilThreshold, setDrySoilThreshold] = useState(650);
+  const [tankEmptyCm, setTankEmptyCm] = useState(120);
+  const [adminPhone, setAdminPhone] = useState("+23324125197");
+  const [reminderIntervalHours, setReminderIntervalHours] = useState(24);
+  const [alertMoistureLevel, setAlertMoistureLevel] = useState(700);
 
+  // Fetch Telemetry Data
   async function fetchReadings() {
-    setLoading(true);
-    let q = supabase
+    const { data, error } = await supabase
       .from("sensor_readings")
       .select("*")
       .order("created_at", { ascending: false })
-      .limit(500);
-    if (fromISO) q = q.gte("created_at", fromISO);
-    const { data, error } = await q;
+      .limit(100);
+
     if (!error && data) {
-      // Ensure newest first by DB time
-      const sorted = (data as SensorReading[]).sort(
-        (a, b) =>
-          new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-      );
-      setReadings(sorted);
+      setReadings(data as TelemetryData[]);
     }
-    setLoading(false);
+    setLoadingReadings(false);
+  }
+
+  // Fetch Config
+  async function fetchConfig() {
+    const { data, error } = await supabase
+      .from("system_configs")
+      .select("*")
+      .eq("id", 1)
+      .single();
+
+    if (!error && data) {
+      const cfg = data as SystemConfig;
+      setConfig(cfg);
+      setPumpCommand(cfg.pump_command);
+      setDrySoilThreshold(cfg.dry_soil_threshold);
+      setTankEmptyCm(cfg.tank_empty_cm);
+      setAdminPhone(cfg.admin_phone);
+      setReminderIntervalHours(cfg.reminder_interval_hours);
+      setAlertMoistureLevel(cfg.alert_moisture_level);
+    } else if (error && error.code === "PGRST116") {
+      // Configuration row not created yet, let's create a default row
+      const defaultCfg = {
+        id: 1,
+        pump_command: "AUTO",
+        dry_soil_threshold: 650,
+        tank_empty_cm: 120,
+        admin_phone: "+23324125197",
+        reminder_interval_hours: 24,
+        alert_moisture_level: 700,
+      };
+      await supabase.from("system_configs").insert([defaultCfg]);
+      setConfig(defaultCfg as SystemConfig);
+    }
+    setLoadingConfig(false);
+  }
+
+  // Update Config on DB
+  async function handleSaveConfig(e: React.FormEvent) {
+    e.preventDefault();
+    setSubmittingConfig(true);
+
+    const updated = {
+      pump_command: pumpCommand,
+      dry_soil_threshold: drySoilThreshold,
+      tank_empty_cm: tankEmptyCm,
+      admin_phone: adminPhone,
+      reminder_interval_hours: reminderIntervalHours,
+      alert_moisture_level: alertMoistureLevel,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error } = await supabase
+      .from("system_configs")
+      .update(updated)
+      .eq("id", 1);
+
+    if (!error) {
+      fetchConfig();
+    }
+    setSubmittingConfig(false);
+  }
+
+  // Quick command update for Pump control buttons
+  async function updatePumpCommand(cmd: "AUTO" | "ON" | "OFF") {
+    setPumpCommand(cmd);
+    const { error } = await supabase
+      .from("system_configs")
+      .update({ pump_command: cmd, updated_at: new Date().toISOString() })
+      .eq("id", 1);
+    if (!error) {
+      fetchConfig();
+    }
   }
 
   useEffect(() => {
     fetchReadings();
-  }, [fromISO]);
+    fetchConfig();
 
-  useEffect(() => {
-    const id = setInterval(fetchReadings, POLL_MS);
-    return () => clearInterval(id);
-  }, [fromISO]);
+    const interval = setInterval(() => {
+      fetchReadings();
+    }, POLL_MS);
+
+    return () => clearInterval(interval);
+  }, []);
 
   const latest = readings[0];
 
-  // Treat true, 1, or "1" as detected (in case your device sends non-boolean)
-  const flame =
-    latest?.flame_detected === true ||
-    latest?.flame_detected === 1 ||
-    latest?.flame_detected === "1";
-
-  // Format helper: always use DB 'created_at' → Accra time
+  // Helper for formatting timestamps
   const formatCreatedAt = (createdAt: string) =>
     new Date(createdAt).toLocaleString("en-GB", {
       timeZone: GH_TZ,
@@ -67,85 +134,309 @@ export default function App() {
       second: "2-digit",
     });
 
+  // Calculate Tank fullness percentage
+  // Assume Full at 20cm, Empty at tank_empty_cm
+  const getTankPercentage = () => {
+    if (!latest || latest.tank_distance_cm <= 0) return 0;
+    const maxVal = tankEmptyCm;
+    const minVal = 20; // assumed full
+    const dist = Math.min(Math.max(latest.tank_distance_cm, minVal), maxVal);
+    const percentage = ((maxVal - dist) / (maxVal - minVal)) * 100;
+    return Math.round(percentage);
+  };
+
   return (
-    <div>
-      <header className="sticky top-0 z-10 bg-white border-b">
-        <div className="container mx-auto py-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans">
+      <header className="sticky top-0 z-10 bg-white border-b border-slate-200">
+        <div className="max-w-7xl mx-auto px-4 py-4 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold text-gray-800">
-              ESP32 Smoke & Gas Dashboard
+            <h1 className="text-xl font-semibold tracking-tight text-slate-900">
+              Soil Irrigation & Telemetry System
             </h1>
-            <div className="text-xs text-gray-500">
-              All times shown in Africa/Accra (from DB <code>created_at</code>)
-            </div>
+            <p className="text-xs text-slate-500 mt-1">
+              Active Monitoring Station | Server Time: Africa/Accra
+            </p>
           </div>
           <div className="flex items-center gap-3">
-            <TimeRangePicker value={range} onChange={setRange} />
             <button
-              onClick={fetchReadings}
-              className="px-3 py-1 rounded-md bg-safe text-white hover:bg-green-600 transition-colors"
+              onClick={() => {
+                fetchReadings();
+                fetchConfig();
+              }}
+              className="px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-md shadow-sm hover:bg-slate-50 focus:outline-none"
             >
-              Refresh
+              Force Sync
             </button>
           </div>
         </div>
       </header>
 
-      <main className="container mx-auto py-6 space-y-8">
-        <div className="grid gap-4 md:grid-cols-3">
+      <main className="max-w-7xl mx-auto px-4 py-6 space-y-6">
+        {/* KPI Row */}
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
           <Card>
-            {/* matches FlameIndicator prop signature */}
-            <FlameIndicator latestFlameDetected={flame} />
-          </Card>
-          <Card>
-            <div className="text-sm opacity-70">Latest Temperature</div>
-            <div className="text-3xl font-bold">
-              {latest?.temperature ?? "—"}°C
+            <div className="text-xs font-medium text-slate-500 uppercase tracking-wider">
+              Soil Moisture
+            </div>
+            <div className="mt-2 flex items-baseline gap-2">
+              <span className="text-3xl font-semibold text-slate-950">
+                {latest?.soil_moisture ?? "—"}
+              </span>
+              <span className="text-xs text-slate-500">
+                / {config?.dry_soil_threshold ?? 650} Max Dry
+              </span>
+            </div>
+            <div className="mt-2 text-xs text-slate-500">
+              {latest && latest.soil_moisture > (config?.dry_soil_threshold ?? 650) ? (
+                <span className="text-amber-600 font-medium">Dry Condition Met</span>
+              ) : (
+                <span className="text-emerald-600 font-medium">Moisture Adequate</span>
+              )}
             </div>
           </Card>
+
           <Card>
-            <div className="text-sm opacity-70">Latest Humidity</div>
-            <div className="text-3xl font-bold">
-              {latest?.humidity ?? "—"}%
+            <div className="text-xs font-medium text-slate-500 uppercase tracking-wider">
+              Water Tank Level
+            </div>
+            <div className="mt-2 flex items-baseline gap-2">
+              <span className="text-3xl font-semibold text-slate-950">
+                {getTankPercentage()}%
+              </span>
+              <span className="text-xs text-slate-500">
+                ({latest?.tank_distance_cm ? `${latest.tank_distance_cm.toFixed(1)} cm` : "—"})
+              </span>
+            </div>
+            <div className="mt-2 text-xs text-slate-500">
+              {latest && latest.tank_distance_cm > (config?.tank_empty_cm ?? 120) ? (
+                <span className="text-red-600 font-medium">Critical: Tank Empty</span>
+              ) : (
+                <span className="text-emerald-600 font-medium">Tank Level Normal</span>
+              )}
+            </div>
+          </Card>
+
+          <Card>
+            <div className="text-xs font-medium text-slate-500 uppercase tracking-wider">
+              Pump System State
+            </div>
+            <div className="mt-2 flex items-baseline justify-between">
+              <span className={`text-xl font-semibold ${latest?.pump_state ? "text-emerald-600" : "text-slate-500"}`}>
+                {latest?.pump_state ? "Active (Pumping)" : "Idle (Off)"}
+              </span>
+            </div>
+            <div className="mt-2 flex gap-1">
+              <button
+                onClick={() => updatePumpCommand("AUTO")}
+                className={`flex-1 text-[10px] font-semibold py-1 rounded border transition-all ${
+                  pumpCommand === "AUTO"
+                    ? "bg-slate-900 border-slate-900 text-white"
+                    : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+                }`}
+              >
+                Auto
+              </button>
+              <button
+                onClick={() => updatePumpCommand("ON")}
+                className={`flex-1 text-[10px] font-semibold py-1 rounded border transition-all ${
+                  pumpCommand === "ON"
+                    ? "bg-emerald-600 border-emerald-600 text-white"
+                    : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+                }`}
+              >
+                On
+              </button>
+              <button
+                onClick={() => updatePumpCommand("OFF")}
+                className={`flex-1 text-[10px] font-semibold py-1 rounded border transition-all ${
+                  pumpCommand === "OFF"
+                    ? "bg-rose-600 border-rose-600 text-white"
+                    : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+                }`}
+              >
+                Off
+              </button>
+            </div>
+          </Card>
+
+          <Card>
+            <div className="text-xs font-medium text-slate-500 uppercase tracking-wider">
+              Sensor Temperatures
+            </div>
+            <div className="mt-2 space-y-1">
+              <div className="flex justify-between">
+                <span className="text-xs text-slate-500">Soil:</span>
+                <span className="text-sm font-semibold text-slate-900">
+                  {latest?.soil_temp ?? "—"}°C
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-xs text-slate-500">Air:</span>
+                <span className="text-sm font-semibold text-slate-900">
+                  {latest?.air_temp ?? "—"}°C
+                </span>
+              </div>
+            </div>
+          </Card>
+
+          <Card>
+            <div className="text-xs font-medium text-slate-500 uppercase tracking-wider">
+              Auxiliary Node Stats
+            </div>
+            <div className="mt-2 space-y-1">
+              <div className="flex justify-between">
+                <span className="text-xs text-slate-500">Humidity:</span>
+                <span className="text-sm font-semibold text-slate-900">
+                  {latest?.air_humidity ?? "—"}%
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-xs text-slate-500">Battery:</span>
+                <span className="text-sm font-semibold text-slate-900">
+                  {latest?.battery_voltage ?? "—"}V
+                </span>
+              </div>
             </div>
           </Card>
         </div>
 
-        <Card title="Temperature & Humidity (Accra time)">
-          {loading && <div className="text-sm opacity-60">Loading…</div>}
-          <TempHumidityChart data={readings} />
-        </Card>
+        {/* Charts & Configuration Split */}
+        <div className="grid gap-6 lg:grid-cols-3">
+          <div className="lg:col-span-2 space-y-6">
+            <Card title="Moisture & Water Level Trends">
+              <MoistureTankChart data={readings} />
+            </Card>
+            <Card title="Environmental Metrics (Temperature & Humidity)">
+              <EnvironmentChart data={readings} />
+            </Card>
+          </div>
 
-        <Card title="Gas Value (Accra time)">
-          <GasChart data={readings} />
-        </Card>
+          <div className="space-y-6">
+            {/* System Threshold and Notification Config */}
+            <Card title="System Parameters & Alerts">
+              {loadingConfig ? (
+                <div className="text-sm text-slate-500 py-4">Loading system configs...</div>
+              ) : (
+                <form onSubmit={handleSaveConfig} className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 uppercase tracking-wider">
+                      Dry Soil Moisture Threshold
+                    </label>
+                    <input
+                      type="number"
+                      value={drySoilThreshold}
+                      onChange={(e) => setDrySoilThreshold(Number(e.target.value))}
+                      className="mt-1 block w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm text-sm focus:outline-none focus:ring-1 focus:ring-slate-900"
+                    />
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Activates the pump in Auto mode if reading rises above this.
+                    </p>
+                  </div>
 
-        <Card title="Recent Readings">
-          <div className="overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead className="text-left opacity-70">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 uppercase tracking-wider">
+                      Critical Tank Height (cm)
+                    </label>
+                    <input
+                      type="number"
+                      value={tankEmptyCm}
+                      onChange={(e) => setTankEmptyCm(Number(e.target.value))}
+                      className="mt-1 block w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm text-sm focus:outline-none focus:ring-1 focus:ring-slate-900"
+                    />
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Distance representing an empty tank (stops the pump immediately).
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 uppercase tracking-wider">
+                      SMS Recipient Number
+                    </label>
+                    <input
+                      type="text"
+                      value={adminPhone}
+                      onChange={(e) => setAdminPhone(e.target.value)}
+                      className="mt-1 block w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm text-sm focus:outline-none focus:ring-1 focus:ring-slate-900"
+                    />
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Number for critical failure notifications and automated alarms.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 uppercase tracking-wider">
+                      Water Reminder Interval (hours)
+                    </label>
+                    <input
+                      type="number"
+                      value={reminderIntervalHours}
+                      onChange={(e) => setReminderIntervalHours(Number(e.target.value))}
+                      className="mt-1 block w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm text-sm focus:outline-none focus:ring-1 focus:ring-slate-900"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 uppercase tracking-wider">
+                      Alert Moisture Level Threshold
+                    </label>
+                    <input
+                      type="number"
+                      value={alertMoistureLevel}
+                      onChange={(e) => setAlertMoistureLevel(Number(e.target.value))}
+                      className="mt-1 block w-full px-3 py-2 border border-slate-300 rounded-md shadow-sm text-sm focus:outline-none focus:ring-1 focus:ring-slate-900"
+                    />
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={submittingConfig}
+                    className="w-full px-4 py-2 text-sm font-semibold text-white bg-slate-900 border border-transparent rounded-md shadow-sm hover:bg-slate-800 disabled:opacity-50 transition-all"
+                  >
+                    {submittingConfig ? "Saving..." : "Save Parameters"}
+                  </button>
+                </form>
+              )}
+            </Card>
+          </div>
+        </div>
+
+        {/* Telemetry Logs */}
+        <Card title="Station Activity Logs">
+          <div className="overflow-x-auto border border-slate-200 rounded-lg">
+            <table className="min-w-full divide-y divide-slate-200 text-xs">
+              <thead className="bg-slate-50 text-left font-medium text-slate-500">
                 <tr>
-                  <th className="py-2 pr-4">Created (DB, Accra)</th>
-                  <th className="py-2 pr-4">Temp (°C)</th>
-                  <th className="py-2 pr-4">Humidity (%)</th>
-                  <th className="py-2 pr-4">Gas</th>
-                  <th className="py-2 pr-4">Flame</th>
+                  <th className="px-4 py-3">Timestamp (Accra)</th>
+                  <th className="px-4 py-3">Soil Moisture</th>
+                  <th className="px-4 py-3">Soil Temp</th>
+                  <th className="px-4 py-3">Air Temp / Hum</th>
+                  <th className="px-4 py-3">Tank (cm)</th>
+                  <th className="px-4 py-3">Pump</th>
+                  <th className="px-4 py-3">Node Battery</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className="divide-y divide-slate-100 bg-white">
                 {readings.map((r) => (
-                  <tr key={r.id} className="border-t">
-                    <td className="py-2 pr-4">{formatCreatedAt(r.created_at)}</td>
-                    <td className="py-2 pr-4">{r.temperature ?? "—"}</td>
-                    <td className="py-2 pr-4">{r.humidity ?? "—"}</td>
-                    <td className="py-2 pr-4">{r.gas_value ?? "—"}</td>
-                    <td className="py-2 pr-4">{r.flame_detected ? "🔥" : "—"}</td>
+                  <tr key={r.id} className="hover:bg-slate-50 transition-colors">
+                    <td className="px-4 py-2 font-mono">{formatCreatedAt(r.created_at)}</td>
+                    <td className="px-4 py-2 font-medium">{r.soil_moisture ?? "—"}</td>
+                    <td className="px-4 py-2">{r.soil_temp ?? "—"}°C</td>
+                    <td className="px-4 py-2">
+                      {r.air_temp ?? "—"}°C / {r.air_humidity ?? "—"}%
+                    </td>
+                    <td className="px-4 py-2">{r.tank_distance_cm ? `${r.tank_distance_cm.toFixed(1)} cm` : "—"}</td>
+                    <td className="px-4 py-2">
+                      <span className={`px-2 py-0.5 rounded font-semibold text-[10px] ${r.pump_state ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-600"}`}>
+                        {r.pump_state ? "ON" : "OFF"}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2">{r.battery_voltage ?? "—"}V</td>
                   </tr>
                 ))}
-                {readings.length === 0 && !loading && (
+                {readings.length === 0 && !loadingReadings && (
                   <tr>
-                    <td className="py-4 opacity-60" colSpan={5}>
-                      No data.
+                    <td className="px-4 py-4 text-center text-slate-400" colSpan={7}>
+                      No recent telemetry received.
                     </td>
                   </tr>
                 )}
@@ -155,8 +446,10 @@ export default function App() {
         </Card>
       </main>
 
-      <footer className="container mx-auto py-8 text-xs opacity-60">
-        Built for academic demonstration — ESP32 Smoke & Gas Detection Dashboard
+      <footer className="bg-white border-t border-slate-200 mt-12">
+        <div className="max-w-7xl mx-auto px-4 py-8 text-center text-xs text-slate-500">
+          Smart Irrigation & Soil Telemetry Dashboard — Prepared for Academic Demonstration.
+        </div>
       </footer>
     </div>
   );
